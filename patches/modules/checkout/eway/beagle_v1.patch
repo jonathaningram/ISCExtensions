@@ -1,0 +1,125 @@
+# HG changeset patch
+# User Jonathan@Jonathan-PC-2
+# Date 1306113373 -36000
+# Node ID 2f6eb9bdf4a4cdbbada7eb5f5aa3da7029267945
+# Parent  c43bfe2d55797aec7d14bffb6ad21b6b7d3e6766
+Issue #26: added modification to eWay module to allow for Beagle Anti-Fraud protection.
+
+diff --git a/r2d2/modules/checkout/eway/lang/en/language.ini b/r2d2/modules/checkout/eway/lang/en/language.ini
+--- a/r2d2/modules/checkout/eway/lang/en/language.ini
++++ b/r2d2/modules/checkout/eway/lang/en/language.ini
+@@ -40,4 +40,10 @@
+ EWayRequireCardCode = "Require Card Code"
+ EWayRequireCardCodeHelp = "If you want to use the EWay Credit Card Veritification Feature to add extra security to credit card transactions, enable this option. This option will require users to enter the CVN code for their credit card during the checkout."
+ EWayRequireCardCodeNo = "No, do not require credit card codes"
+-EWayRequireCardCodeYes = "Yes, require credit card codes"
+\ No newline at end of file
++EWayRequireCardCodeYes = "Yes, require credit card codes"
++
++EWayUseBeagle = "Use Beagle Anti-Fraud"
++EWayUseBeagleHelp = "If you want to use the EWay Beagle Anti-Fraud feature to block or flag potential fraudulent credit card transactions, enable this option. This option also requires the card code option to be enabled."
++EWayUseBeagleNo = "No, do not enable Beagle Anti-Fraud"
++EWayUseBeagleYes = "Yes, enable Beagle Anti-Fraud"
++EWayUseBeagleEnabled = "eWay Beagle Anti-Fraud enabled, adding additional fields:"
+diff --git a/r2d2/modules/checkout/eway/module.eway.php b/r2d2/modules/checkout/eway/module.eway.php
+--- a/r2d2/modules/checkout/eway/module.eway.php
++++ b/r2d2/modules/checkout/eway/module.eway.php
+@@ -76,6 +76,19 @@
+ 				),
+ 				"multiselect" => false
+ 			);
++			
++			$this->_variables['usebeagle'] = array(
++				"name" => GetLang('EWayUseBeagle'),
++				"type" => "dropdown",
++				"help" => GetLang('EWayUseBeagleHelp'),
++				"default" => "no",
++				"required" => true,
++				"options" => array(
++					GetLang('EWayUseBeagleNo') => "NO",
++					GetLang('EWayUseBeagleYes') => "YES"
++				),
++				"multiselect" => false
++			);
+ 		}
+ 
+ 		/**
+@@ -195,7 +208,14 @@
+ 				$ccexpm = $dataSource['eway_ccexpm'];
+ 				$ccexpy = $dataSource['eway_ccexpy'];
+ 
+-				if ($this->GetValue('requirecvn') == 'YES' && isset($dataSource['eway_cvn'])) {
++				/**
++				 * If CVNs are required, or Beagle Anti-Fraud is enabled and the
++				 * CVN is set, set the CVN variable.
++				 * 
++				 * Note: Beagle requires the CVN, so even if the administrator
++				 * has not selected to use the CVN, the variable must be set.
++				 */
++				if (($this->GetValue('requirecvn') == 'YES' || $this->GetValue('usebeagle') == 'YES') && isset($dataSource['eway_cvn'])) {
+ 					$cvn = $dataSource['eway_cvn'];
+ 				} else {
+ 					$cvn = '';
+@@ -226,7 +246,10 @@
+ 					$ccnum = "4444333322221111";
+ 				}
+ 				else {
+-					if($this->GetValue('requirecvn') == 'YES') {
++					if ($this->GetValue('usebeagle') == 'YES') {
++						$eWayUrl = 'https://www.eway.com.au/gateway_cvn/xmlbeagle.asp';
++					}
++					else if ($this->GetValue('requirecvn') == 'YES') {
+ 						$eWayUrl = 'https://www.eway.com.au/gateway_cvn/xmlpayment.asp';
+ 					}
+ 					else {
+@@ -252,12 +275,40 @@
+ 				$xml->addChild('ewayCardExpiryMonth', $ccexpm);
+ 				$xml->addChild('ewayCardExpiryYear', $ccexpy);
+ 
+-				if ($this->GetValue('requirecvn') == 'YES') {
++				/**
++				 * If CVNs are required, or Beagle Anti-Fraud is enabled, add
++				 * the CVN to the XML.
++				 * 
++				 * Note: Beagle requires the CVN, so even if the administrator
++				 * has not selected to use the CVN, it will be added to the XML
++				 * if Beagle is enabled.
++				 */
++				if ($this->GetValue('requirecvn') == 'YES' || $this->GetValue('usebeagle') == 'YES') {
+ 					$xml->addChild('ewayCVN', $cvn);
+ 				}
+ 				else {
+ 					$xml->addChild('ewayCVN', '');
+ 				}
++				
++				/**
++				 * Now, add the remaining fields required by Beagle.
++				 * 
++				 * The customer IP address is required, along with the customer
++				 * billing country code (two-letter ISO-3166 code).
++				 */
++				if ($this->GetValue('usebeagle') == 'YES') {
++					$customerIpAddress = $_SERVER['REMOTE_ADDR'];
++					$customerBillingCountryIso2 = trim($billingDetails['ordbillcountrycode']);
++					
++					$GLOBALS['ISC_CLASS_LOG']->LogSystemDebug(array('payment', $this->GetName()), GetLang('EWayUseBeagleEnabled'), var_export(array(
++						'ewayCustomerIPAddress'			=> $customerIpAddress, 
++						'ewayCustomerBillingCountry'	=> $customerBillingCountryIso2,
++					), true));
++					
++					$xml->addChild('ewayCustomerIPAddress', $customerIpAddress);
++					$xml->addChild('ewayCustomerBillingCountry', $customerBillingCountryIso2);
++				}
++				
+ 				$xml->addChild('ewayTrxnNumber', $order['orderid']);
+ 				$xml->addChild('ewayOption1', '');
+ 				$xml->addChild('ewayOption2', '');
+@@ -266,6 +317,8 @@
+ 
+ 				$result = PostToRemoteFileAndGetResponse($eWayUrl, $ewayXML);
+ 
++				$GLOBALS['ISC_CLASS_LOG']->LogSystemDebug(array('payment', $this->GetName()), 'eWay response XML:', htmlentities($result, ENT_QUOTES));
++				
+ 				if($result === false || $result == null) {
+ 					$this->SetError("An error occured while trying to contact eWay.");
+ 					return false;
